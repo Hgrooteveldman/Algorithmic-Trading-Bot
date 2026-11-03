@@ -44,6 +44,13 @@ def _env_float(name: str, default: float) -> float:
     return float(value) if value not in (None, "") else default
 
 
+def _env_mapping(name: str) -> dict[str, str]:
+    """``SYMBOL_SECTORS=AAPL:tech,MSFT:tech,XOM:energy`` -> {"AAPL": "tech", ...}"""
+    value = os.getenv(name, "")
+    pairs = (item.split(":", 1) for item in value.split(",") if ":" in item)
+    return {symbol.strip().upper(): sector.strip().lower() for symbol, sector in pairs if symbol.strip()}
+
+
 def _env_list(name: str, default: List[str]) -> List[str]:
     value = os.getenv(name)
     if not value:
@@ -273,6 +280,20 @@ class Settings:
     # Touch this file to halt the bot at the next loop iteration:
     #   touch logs/STOP
     kill_switch_path: Path = LOGS_DIR / "STOP"
+
+    # ------------------------------------------------------------------
+    # Dynamic sizing, regime filter and performance kill-switch
+    # ------------------------------------------------------------------
+    max_sector_pct: float = _env_float("MAX_SECTOR_PCT", 0.25)
+    symbol_sectors: dict = field(default_factory=lambda: _env_mapping("SYMBOL_SECTORS"))
+    kelly_fraction: float = _env_float("KELLY_FRACTION", 0.25)
+    kelly_min_trades: int = _env_int("KELLY_MIN_TRADES", 30)
+    regime_filter: bool = _env_bool("REGIME_FILTER", True)
+    perf_window_trades: int = _env_int("PERF_WINDOW_TRADES", 40)
+    perf_min_trades: int = _env_int("PERF_MIN_TRADES", 25)
+    perf_sharpe_floor: float = _env_float("PERF_SHARPE_FLOOR", -0.10)
+    perf_sortino_floor: float = _env_float("PERF_SORTINO_FLOOR", -0.15)
+    perf_confirmations: int = _env_int("PERF_CONFIRMATIONS", 3)
 
     @property
     def base_url(self) -> str:

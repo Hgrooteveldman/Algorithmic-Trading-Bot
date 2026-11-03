@@ -15,12 +15,19 @@ align to allow a bad trade through:
     6. No-trade time window (open / close volatility)
     7. Position-size cap (% of equity)
     8. Risk-per-trade cap (% of equity at risk)
+    9. Dynamic sizing (src/risk/sizing.py): volatility target, regime
+       multiplier, fractional-Kelly ceiling, per-asset and per-sector caps
+   10. Performance kill-switch (src/risk/performance_monitor.py)
+
+Halts (daily/weekly loss, circuit breaker, performance kill-switch) raise an
+operator alert through src/monitoring/alerts.py.
 
 When in doubt, REJECT.
 """
 from __future__ import annotations
 
 import math
+from collections import deque
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from typing import Iterable, Optional, Tuple
@@ -30,6 +37,12 @@ from loguru import logger
 
 from config.settings import settings
 from src.market.session import is_flatten_window, is_opening_no_trade_window
+from src.monitoring.alerts import AlertSink, alerts as default_alerts
+from src.monitoring.logger import audit
+from src.risk.performance_monitor import PerformanceMonitor
+from src.risk.sizing import DynamicSizer, SizingDecision
+
+TRADE_HISTORY_LENGTH = 200
 
 
 @dataclass
@@ -47,7 +60,12 @@ class RiskState:
 
 
 class RiskManager:
-    def __init__(self, starting_equity: float):
+    def __init__(
+        self,
+        starting_equity: float,
+        alert_sink: AlertSink | None = None,
+        atr_stop_mult: float | None = None,
+    ):
         week_key = self._week_key(self._utc_now().date())
         self.state = RiskState(
             starting_equity_today=starting_equity,
@@ -55,6 +73,33 @@ class RiskManager:
             current_week_key=week_key,
             peak_equity=starting_equity,
         )
+        self.alerts = alert_sink or default_alerts
+        self.trade_returns: deque[float] = deque(maxlen=TRADE_HISTORY_LENGTH)
+        self.performance = PerformanceMonitor(
+            window=settings.perf_window_trades,
+            min_trades=settings.perf_min_trades,
+            sharpe_floor=settings.perf_sharpe_floor,
+            sortino_floor=settings.perf_sortino_floor,
+            confirmations=settings.perf_confirmations,
+            kill_switch_path=settings.kill_switch_path,
+            alert_sink=self.alerts,
+        )
+        self.sizer = DynamicSizer(
+            risk_per_trade_pct=settings.risk_per_trade_pct,
+            atr_stop_mult=atr_stop_mult if atr_stop_mult is not None else settings.mr_atr_stop_mult,
+            max_position_pct=settings.max_position_pct,
+            max_sector_pct=settings.max_sector_pct,
+            kelly_fraction=settings.kelly_fraction,
+            min_trades_for_kelly=settings.kelly_min_trades,
+            round_trip_friction_pct=settings.round_trip_friction_pct,
+            sector_by_symbol=dict(settings.symbol_sectors),
+        )
+
+    def _halt(self, event: str, message: str, **fields) -> None:
+        """Set the halt flag once and alert on the transition only."""
+        if not self.state.halted:
+            self.alerts.send(event, message, **fields)
+        self.state.halted = True
 
     # ------------------------------------------------------------------
     # State updates
@@ -72,8 +117,13 @@ class RiskManager:
         self.state.current_week_key = self._week_key(self._utc_now().date())
         logger.info(f"Weekly risk state reset. Starting equity: ${equity:,.2f}")
 
-    def record_trade_outcome(self, pnl: float) -> None:
-        """Call when a position closes so cooldown logic works."""
+    def record_trade_outcome(self, pnl: float, pnl_pct: float | None = None) -> None:
+        """Call when a position closes: feeds the cooldown, the Kelly
+        estimate and the performance kill-switch."""
+        if pnl_pct is not None and math.isfinite(pnl_pct):
+            self.trade_returns.append(float(pnl_pct))
+            if self.performance.record(float(pnl_pct)):
+                self.state.halted = True
         if pnl < 0:
             self.state.consecutive_losses += 1
             self.state.last_loss_time = self._utc_now()
@@ -105,13 +155,14 @@ class RiskManager:
         threshold = self.state.peak_equity * (1 - max_drawdown_pct)
         if current_equity <= threshold:
             self.state.circuit_breaker_halted = True
-            logger.error(
-                "PORTFOLIO CIRCUIT BREAKER HIT: equity ${:.2f} <= ${:.2f} "
-                "({:.2%} drawdown from peak ${:.2f}). Halting new entries.",
-                current_equity,
-                threshold,
-                max_drawdown_pct,
-                self.state.peak_equity,
+            self.alerts.send(
+                "circuit_breaker",
+                f"PORTFOLIO CIRCUIT BREAKER HIT: equity ${current_equity:,.2f} <= ${threshold:,.2f} "
+                f"({max_drawdown_pct:.2%} drawdown from peak ${self.state.peak_equity:,.2f}). "
+                "Halting new entries.",
+                equity=current_equity,
+                threshold=threshold,
+                peak_equity=self.state.peak_equity,
             )
             return True
         return False
@@ -136,6 +187,8 @@ class RiskManager:
             ),
             "halted": self.state.halted,
             "circuit_breaker_halted": self.state.circuit_breaker_halted,
+            "trade_returns": list(self.trade_returns),
+            "performance": self.performance.snapshot(),
         }
 
     def restore(self, snapshot: dict | None) -> None:
@@ -166,6 +219,10 @@ class RiskManager:
         self.state.circuit_breaker_halted = bool(
             snapshot.get("circuit_breaker_halted", self.state.circuit_breaker_halted)
         )
+        self.trade_returns = deque(
+            (float(r) for r in snapshot.get("trade_returns", [])), maxlen=TRADE_HISTORY_LENGTH
+        )
+        self.performance.restore(snapshot.get("performance"))
 
     def register_order(self) -> None:
         """Call after submitting any order, for rate-limit accounting."""
@@ -205,9 +262,11 @@ class RiskManager:
                 / self.state.starting_equity_today
             )
             if daily_pnl_pct <= -settings.max_daily_loss_pct:
-                self.state.halted = True
-                logger.error(
-                    f"DAILY LOSS LIMIT HIT: {daily_pnl_pct:.2%}. Halting for the day."
+                self._halt(
+                    "daily_loss_limit",
+                    f"DAILY LOSS LIMIT HIT: {daily_pnl_pct:.2%}. Halting for the day.",
+                    daily_pnl_pct=daily_pnl_pct,
+                    limit_pct=settings.max_daily_loss_pct,
                 )
                 return False, f"Daily loss limit reached ({daily_pnl_pct:.2%})"
 
@@ -217,9 +276,11 @@ class RiskManager:
                 / self.state.starting_equity_week
             )
             if weekly_pnl_pct <= -settings.max_weekly_loss_pct:
-                self.state.halted = True
-                logger.error(
-                    f"WEEKLY LOSS LIMIT HIT: {weekly_pnl_pct:.2%}. Halting for the week."
+                self._halt(
+                    "weekly_loss_limit",
+                    f"WEEKLY LOSS LIMIT HIT: {weekly_pnl_pct:.2%}. Halting for the week.",
+                    weekly_pnl_pct=weekly_pnl_pct,
+                    limit_pct=settings.max_weekly_loss_pct,
                 )
                 return False, f"Weekly loss limit reached ({weekly_pnl_pct:.2%})"
 
@@ -369,6 +430,48 @@ class RiskManager:
         )
 
         return max(0, min(qty_by_risk, qty_by_size))
+
+    def size_entry(
+        self,
+        *,
+        symbol: str,
+        equity: float,
+        entry_price: float,
+        stop_loss_price: float,
+        atr: float | None = None,
+        regime_multiplier: float = 1.0,
+        notional_by_symbol: dict[str, float] | None = None,
+    ) -> SizingDecision:
+        """Dynamic size, never larger than the legacy fixed-risk size (which
+        also prices in friction and overnight gap risk)."""
+        decision = self.sizer.size(
+            symbol=symbol,
+            equity=equity,
+            price=entry_price,
+            stop_price=stop_loss_price,
+            atr=atr,
+            regime_multiplier=regime_multiplier,
+            trade_returns=list(self.trade_returns),
+            notional_by_symbol=notional_by_symbol,
+        )
+        legacy = self.calculate_position_size(equity, entry_price, stop_loss_price)
+        components = {**decision.components, "legacy_fixed_risk": float(legacy)}
+        binding = decision.binding
+        qty = decision.qty
+        if legacy < qty:
+            qty, binding = legacy, "legacy_fixed_risk"
+        result = SizingDecision(max(int(qty), 0), binding, components, decision.kelly)
+        audit(
+            "sizing",
+            symbol=symbol,
+            qty=result.qty,
+            binding=result.binding,
+            regime_multiplier=regime_multiplier,
+            atr=atr,
+            kelly_full=result.kelly.full_kelly if result.kelly else None,
+            **{f"cand_{k}": v for k, v in components.items()},
+        )
+        return result
 
     def _roll_session_state_if_needed(self, equity: float) -> None:
         today = self._utc_now().date()

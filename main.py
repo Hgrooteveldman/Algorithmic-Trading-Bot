@@ -25,6 +25,7 @@ from src.execution.trade_reconciliation import (
 )
 from src.market.session import is_flatten_window, market_session_date
 from src.monitoring.logger import setup_logger
+from src.regime.detector import regime_multipliers
 from src.risk.risk_manager import RiskManager
 from src.runtime.state_store import ManagedPositionSnapshot, RuntimeState, RuntimeStateStore
 from src.strategy.evidence_momentum import (
@@ -84,6 +85,7 @@ def main() -> None:
         time.sleep(5)
 
     strategy_mode = settings.strategy_mode
+    regime_kind = "momentum" if strategy_mode == "evidence_momentum" else "mean_reversion"
     if strategy_mode == "evidence_momentum":
         strategy_config = build_evidence_live_config()
         lookback_days = evidence_momentum_lookback_days(strategy_config)
@@ -127,7 +129,10 @@ def main() -> None:
     state_store = RuntimeStateStore(settings.runtime_state_path)
     runtime_state = state_store.load()
 
-    risk = RiskManager(starting_equity=float(account.equity))
+    risk = RiskManager(
+        starting_equity=float(account.equity),
+        atr_stop_mult=strategy_config.atr_stop_mult,
+    )
     risk.restore(runtime_state.risk)
     executor = OrderExecutor(broker=broker, risk=risk)
 
@@ -158,9 +163,15 @@ def main() -> None:
                 tracked_positions=tracked_positions,
                 processed_exit_order_ids=processed_exit_order_ids,
                 last_reconciled_fill_at=last_reconciled_fill_at,
+                entry_estimates=executor.entry_estimates,
             )
-            for pnl in reconciliation.realized_pnls:
-                risk.record_trade_outcome(pnl)
+            for index, pnl in enumerate(reconciliation.realized_pnls):
+                pnl_pct = (
+                    reconciliation.realized_returns[index]
+                    if index < len(reconciliation.realized_returns)
+                    else None
+                )
+                risk.record_trade_outcome(pnl, pnl_pct)
             tracked_positions = reconciliation.tracked_positions
             processed_exit_order_ids = reconciliation.processed_exit_order_ids
             last_reconciled_fill_at = reconciliation.last_reconciled_fill_at
@@ -421,6 +432,14 @@ def main() -> None:
                     config=strategy_config,
                 )
                 live_positions = broker.get_positions()
+                regime_multiplier = 1.0
+                if settings.regime_filter:
+                    regime_multiplier = float(
+                        regime_multipliers(bars, kind=regime_kind).iloc[-1]
+                    )
+                    if regime_multiplier <= 0:
+                        logger.info("[{}] Regime filter: no entry in this regime.", symbol)
+                        continue
                 submission = executor.open_long_with_levels(
                     symbol=symbol,
                     stop_loss_price=seeded_position.stop_price,
@@ -428,6 +447,7 @@ def main() -> None:
                     bars=bars,
                     positions=live_positions,
                     correlation_returns_cache=correlation_returns_cache,
+                    regime_multiplier=regime_multiplier,
                 )
                 if submission is None:
                     continue

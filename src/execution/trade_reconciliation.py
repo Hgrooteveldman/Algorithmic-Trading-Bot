@@ -1,12 +1,13 @@
 """Reconcile closed trades into realized P&L for live risk controls."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Iterable
 
 from alpaca.trading.enums import OrderSide, OrderStatus
 
+from src.monitoring.logger import audit
 from src.runtime.state_store import PositionSnapshot
 
 
@@ -16,6 +17,7 @@ class ReconciliationResult:
     tracked_positions: dict[str, PositionSnapshot]
     processed_exit_order_ids: list[str]
     last_reconciled_fill_at: datetime | None
+    realized_returns: list[float] = field(default_factory=list)
 
 
 def snapshot_open_positions(positions: Iterable) -> dict[str, PositionSnapshot]:
@@ -42,10 +44,16 @@ def reconcile_closed_trades(
     tracked_positions: dict[str, PositionSnapshot],
     processed_exit_order_ids: list[str],
     last_reconciled_fill_at: datetime | None,
+    entry_estimates: dict[str, dict] | None = None,
 ) -> ReconciliationResult:
+    """Turn newly filled exit orders into realised P&L (and returns, for the
+    Kelly estimate and the performance kill-switch). Filled entry orders that
+    have a pre-trade estimate in ``entry_estimates`` (keyed by order id) are
+    logged with their realised slippage against that estimate."""
     processed_ids = set(processed_exit_order_ids)
     updated_positions = dict(tracked_positions)
     realized_pnls: list[float] = []
+    realized_returns: list[float] = []
     latest_fill_at = last_reconciled_fill_at
 
     after = last_reconciled_fill_at or default_reconciliation_start()
@@ -60,6 +68,23 @@ def reconcile_closed_trades(
             continue
         side = getattr(order, "side", None)
         status = getattr(order, "status", None)
+        if side == OrderSide.BUY and status == OrderStatus.FILLED and entry_estimates is not None:
+            estimate = entry_estimates.pop(order_id, None)
+            fill = float(getattr(order, "filled_avg_price", 0) or 0)
+            if estimate and fill > 0 and estimate.get("reference_price", 0) > 0:
+                actual_bps = (fill / estimate["reference_price"] - 1) * 10_000
+                audit(
+                    "entry_filled",
+                    trade_id=order_id,
+                    symbol=getattr(order, "symbol", None),
+                    fill_price=fill,
+                    reference_price=estimate["reference_price"],
+                    est_slippage_bps=estimate.get("est_slippage_bps"),
+                    actual_slippage_bps=actual_bps,
+                    slippage_error_bps=actual_bps - float(estimate.get("est_slippage_bps") or 0.0),
+                    submit_to_fill_s=(filled_at - estimate["submitted_at"]).total_seconds()
+                    if estimate.get("submitted_at") is not None else None,
+                )
         if side != OrderSide.SELL or status != OrderStatus.FILLED:
             continue
 
@@ -71,6 +96,17 @@ def reconcile_closed_trades(
         if tracked is not None and filled_qty > 0 and fill_price > 0:
             qty_closed = min(filled_qty, tracked.qty)
             realized_pnls.append(qty_closed * (fill_price - tracked.avg_entry_price))
+            realized_returns.append(fill_price / tracked.avg_entry_price - 1)
+            audit(
+                "exit_filled",
+                trade_id=order_id,
+                symbol=symbol,
+                qty=qty_closed,
+                fill_price=fill_price,
+                avg_entry_price=tracked.avg_entry_price,
+                pnl=realized_pnls[-1],
+                pnl_pct=realized_returns[-1],
+            )
             remaining_qty = tracked.qty - qty_closed
             if remaining_qty > 1e-9:
                 updated_positions[order.symbol] = PositionSnapshot(
@@ -88,5 +124,6 @@ def reconcile_closed_trades(
         realized_pnls=realized_pnls,
         tracked_positions=updated_positions,
         processed_exit_order_ids=sorted(processed_ids),
+        realized_returns=realized_returns,
         last_reconciled_fill_at=latest_fill_at,
     )

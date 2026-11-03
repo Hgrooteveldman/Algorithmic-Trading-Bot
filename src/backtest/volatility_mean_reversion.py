@@ -38,6 +38,7 @@ from typing import Iterable
 import numpy as np
 import pandas as pd
 
+from src.regime.detector import regime_multipliers
 from src.backtest.execution_model import (
     ExecutionModel,
     decision_view,
@@ -47,6 +48,7 @@ from src.backtest.execution_model import (
 )
 
 DECISION_COLUMNS = (
+    "regime_multiplier",
     "atr",
     "bb_mid",
     "rsi",
@@ -111,6 +113,8 @@ class MeanReversionConfig:
     max_gross_exposure_pct: float = 0.75
     max_open_positions: int = 4
     circuit_breaker_drawdown_pct: float = 0.25
+    # Scale or skip entries by market regime (src/regime/detector.py).
+    regime_filter: bool = True
 
     allow_short: bool = False
 
@@ -453,6 +457,9 @@ def backtest_mean_reversion_portfolio(
         if "timestamp" not in frame.columns:
             frame = frame.rename(columns={frame.columns[0]: "timestamp"})
         require_columns(frame, ["open", "high", "low", "close"])
+        frame["regime_multiplier"] = (
+            regime_multipliers(frame, kind="mean_reversion").to_numpy() if config.regime_filter else 1.0
+        )
         frame = decision_view(frame, DECISION_COLUMNS)
         frames[symbol] = frame
         latest_prices[symbol] = float(frame["close"].iloc[0])
@@ -692,6 +699,9 @@ def backtest_mean_reversion_portfolio(
             else:
                 qty_by_available_cash = floor(available_notional / max(open_price, 1e-9))
             qty = max(min(qty_by_risk, qty_by_position_cap, qty_by_available_cash), 0)
+            regime_scale = row.get("prev_regime_multiplier")
+            if regime_scale is not None and pd.notna(regime_scale):
+                qty = floor(qty * min(float(regime_scale), 1.0))
             if qty <= 0:
                 continue
             entry_price = model.fill(side, open_price, qty, **bar_context(row, open_price)).price
