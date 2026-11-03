@@ -1,0 +1,6 @@
+alpaca-py>=0.30.0
+pandas>=2.0
+numpy>=1.24
+python-dotenv>=1.0
+loguru>=0.7
+pytest>=7.0

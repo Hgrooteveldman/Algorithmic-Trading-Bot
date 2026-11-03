@@ -1,0 +1,15 @@
+.env
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+logs/
+.pytest_cache/
+.DS_Store
+*.egg-info/
+.idea/
+.vscode/
+
+# Local run artefacts
+outputs/
+state/
