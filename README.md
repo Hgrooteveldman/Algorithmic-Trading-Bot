@@ -64,6 +64,17 @@ touch logs/STOP
 | `src/risk/risk_manager.py` | Pre-trade gates and position sizing |
 | `src/execution/order_executor.py` | Bracket-order submission |
 | `src/backtest/backtester.py` | Event-driven backtester |
+| `src/backtest/execution_model.py` | Next-open fills, gap handling, fees, spread and linear impact |
+| `src/validation/cpcv.py` | Combinatorial purged cross-validation, probability of backtest overfitting |
+| `src/analytics/metrics.py` | Sortino, Calmar, Omega, drawdown duration, probabilistic and deflated Sharpe |
+| `src/analytics/report.py` | Markdown / HTML performance reports |
+| `src/regime/detector.py` | ATR%/ADX regimes, optional two-state Gaussian HMM, size policy |
+| `src/risk/sizing.py` | Volatility targeting, fractional-Kelly ceiling, asset and sector caps |
+| `src/risk/performance_monitor.py` | Rolling Sharpe/Sortino kill-switch |
+| `src/monitoring/alerts.py` | Risk alerts to the log and an optional webhook |
+| `src/broker/models.py` | Pydantic v2 models for quotes, bars, orders and fills |
+| `src/broker/retry.py` | Exponential backoff with jitter for idempotent broker reads |
+| `src/data/bar_stream.py` | Reconnecting bar stream that wakes the live loop |
 | `src/backtest/evidence_momentum.py` | Momentum backtester and optimiser |
 | `src/backtest/volatility_mean_reversion.py` | Mean-reversion backtester and optimiser |
 | `src/backtest/sweep.py` | Parameter sweeps |
@@ -74,7 +85,40 @@ touch logs/STOP
 | `main.py` | Live/paper trading orchestrator |
 | `run_backtest.py` | Backtest entry point |
 | `run_parameter_sweep.py` | Parameter-sweep entry point |
-| `tests/` | Pytest suite (41 tests: risk, strategies, backtests, state) |
+| `tests/` | Pytest suite (130 tests, broker faked with pytest-mock) |
+
+## Research integrity
+
+Backtests are only useful if they cannot see the future and are not just the
+luckiest of many tries. The research layer enforces both:
+
+- **No same-bar fills.** A signal computed on a bar's close is filled at the
+  *next* bar's open. Engines read decisions from `prev_*` columns, and a
+  truncation test checks that adding future bars never changes past trades.
+- **Realistic friction.** Each fill pays a fee tier, a half spread (range
+  proxy with a floor) and linear market impact on its share of bar volume.
+  Stops that the market gaps through fill at the open.
+- **Selection-bias checks.** `run_parameter_sweep.py` reports, for the
+  winning configuration, the **Deflated Sharpe Ratio** (corrected for the
+  number of configurations tried), the **CPCV** distribution of
+  out-of-sample Sharpe ratios (purged and embargoed), and the **probability
+  of backtest overfitting**, and writes an HTML report.
+
+Expect results to look worse than before these changes. That is the point.
+
+## Live risk layer
+
+- **Sizing:** volatility targeting (inverse ATR) scaled by the market regime,
+  never above a 0.25x Kelly estimate from the bot's own trades, the
+  per-asset cap, the per-sector cap (`SYMBOL_SECTORS`, `MAX_SECTOR_PCT`) or
+  the original fixed-risk size.
+- **Regime filter (`REGIME_FILTER`):** mean reversion halves size in trends
+  and stands aside in volatile trends; momentum stands aside in quiet chop.
+- **Kill-switches:** daily and weekly loss limits, the drawdown circuit
+  breaker and a rolling Sharpe/Sortino monitor. All alert through the log
+  and, if set, `ALERT_WEBHOOK_URL`.
+- **Audit trail:** `logs/bot_*.jsonl` holds one JSON event per order, fill
+  and sizing decision, with estimated vs realised slippage and latency.
 
 ## Risk parameters (defaults — review before changing)
 
