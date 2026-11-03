@@ -1,9 +1,24 @@
 # Algorithmic Trading Bot (Alpaca)
 
-A modular, risk-controlled algorithmic trading skeleton for Alpaca, designed
-for **paper-first** development. The included strategy (SMA crossover) is an
-example only — the value is in the surrounding architecture: risk gates,
-bracket orders, kill-switch, position sizing, logging, and backtesting.
+A modular, risk-controlled algorithmic trading system for Alpaca, built
+**paper-first**. It combines a research layer (backtesting and parameter
+optimisation) with a live layer that runs every order through layered risk
+gates, bracket orders and a kill-switch.
+
+**Strategies** (select with `STRATEGY_MODE` in `.env`):
+
+- **Evidence-based momentum** (`evidence_momentum`, default) — cross-sectional
+  momentum, time-series momentum / trend filter and 52-week-high persistence,
+  rebalanced at low turnover. Based on the strategy families that hold up best
+  after costs in the academic literature.
+- **Volatility-adjusted mean reversion** (`mean_reversion`) — trades stretched
+  prices (Bollinger / Keltner bands) with RSI confirmation and ATR-based
+  trailing exits.
+- **Trend-following pullback** (`src/strategy/sma_crossover.py`) — the original
+  SMA-based research strategy, kept for comparison.
+
+**Research tooling:** event-driven backtester, walk-forward parameter sweeps
+with in-sample / out-of-sample splits, and per-trade output for review.
 
 > **WARNING** — Trading real money carries the risk of significant loss.
 > A profitable backtest does not imply future profits. Validate this system
@@ -43,14 +58,23 @@ touch logs/STOP
 | `src/broker/alpaca_client.py` | Single gateway to Alpaca's API |
 | `src/data/market_data.py` | Bar fetching with liquidity filter |
 | `src/strategy/base.py` | Strategy abstract base class |
-| `src/strategy/sma_crossover.py` | Example SMA crossover strategy |
+| `src/strategy/evidence_momentum.py` | Live helpers for the momentum strategy |
+| `src/strategy/mean_reversion.py` | Live helpers for the mean-reversion strategy |
+| `src/strategy/sma_crossover.py` | Trend-following pullback strategy |
 | `src/risk/risk_manager.py` | Pre-trade gates and position sizing |
 | `src/execution/order_executor.py` | Bracket-order submission |
 | `src/backtest/backtester.py` | Event-driven backtester |
+| `src/backtest/evidence_momentum.py` | Momentum backtester and optimiser |
+| `src/backtest/volatility_mean_reversion.py` | Mean-reversion backtester and optimiser |
+| `src/backtest/sweep.py` | Parameter sweeps |
+| `src/execution/trade_reconciliation.py` | Reconciles fills with broker state |
+| `src/runtime/state_store.py` | Persists runtime state across restarts |
+| `src/market/session.py` | Market-hours / session logic |
 | `src/monitoring/logger.py` | Loguru setup |
 | `main.py` | Live/paper trading orchestrator |
 | `run_backtest.py` | Backtest entry point |
-| `tests/` | Pytest tests (start with risk manager) |
+| `run_parameter_sweep.py` | Parameter-sweep entry point |
+| `tests/` | Pytest suite (41 tests: risk, strategies, backtests, state) |
 
 ## Risk parameters (defaults — review before changing)
 
@@ -58,12 +82,12 @@ touch logs/STOP
 |-----------|-------|---------|
 | `max_position_pct` | 10% | Cap of equity per single position |
 | `max_daily_loss_pct` | 2% | Halts the bot for the day if breached |
-| `stop_loss_pct` | 2% | Per-trade stop loss |
-| `take_profit_pct` | 4% | Per-trade take profit (1:2 R:R) |
-| `risk_per_trade_pct` | 0.5% | Equity at risk per trade |
-| `max_open_positions` | 5 | Concurrent positions cap |
+| `stop_loss_pct` | 1.5% | Per-trade stop loss |
+| `take_profit_pct` | 3% | Per-trade take profit (1:2 R:R) |
+| `risk_per_trade_pct` | 0.15% | Equity at risk per trade |
+| `max_open_positions` | 4 | Concurrent positions cap |
 | `cooldown_after_consecutive_losses` | 3 | Pauses for `cooldown_minutes` |
-| `min_avg_daily_volume` | 1M shares | Liquidity floor |
+| `min_avg_daily_dollar_volume` | $50M | Liquidity floor (avg daily dollar volume) |
 | `use_leverage` | False | Must explicitly enable |
 
 ## Pre-flight checklist before going LIVE
@@ -85,7 +109,7 @@ touch logs/STOP
 - Risk parameters scattered across files — here they are all in one settings module.
 - Single point of failure in the strategy layer — every order goes through risk gates.
 - Implicit leverage on margin accounts — we size against equity by default.
-- Trading illiquid names — liquidity filter rejects below `min_avg_daily_volume`.
+- Trading illiquid names — liquidity filter rejects below `min_avg_daily_dollar_volume`.
 - No way to stop the bot mid-session — kill-switch file solves this.
 
 ## Disclaimer
