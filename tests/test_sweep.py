@@ -100,3 +100,24 @@ def test_sample_sweep_configs_spreads_across_grid():
     sampled = sample_sweep_configs(configs, 3)
 
     assert [config.short_window for config in sampled] == [10, 30, 50]
+
+
+def test_overfitting_diagnostics_on_synthetic_sweep() -> None:
+    import numpy as np
+    import pandas as pd
+
+    from src.backtest.sweep import overfitting_diagnostics
+
+    rng = np.random.default_rng(11)
+    index = pd.date_range("2025-01-02 14:30", periods=1400, freq="h")
+    curves = {
+        f"cfg{i}": pd.Series(100_000 * np.cumprod(1 + rng.normal(0, 0.002, len(index))), index=index)
+        for i in range(12)
+    }
+    best = max(curves, key=lambda k: curves[k].iloc[-1])
+    result = overfitting_diagnostics(curves, best_label=best, bars_per_year=252 * 7, pbo_blocks=6)
+    assert result.n_trials == 12
+    assert 0.0 <= result.deflated_sharpe <= 1.0
+    assert result.deflated_sharpe < 0.95  # noise should not look like skill
+    assert result.cpcv["n_paths"] == 5
+    assert result.pbo is not None and 0.0 <= result.pbo <= 1.0

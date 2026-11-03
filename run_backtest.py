@@ -31,6 +31,8 @@ from src.backtest.volatility_mean_reversion import (
     backtest_mean_reversion_portfolio,
     optimize_mean_reversion,
 )
+from src.analytics.metrics import summarize
+from src.analytics.report import ValidationSummary, write_report
 from src.broker.alpaca_client import _to_alpaca_timeframe
 
 
@@ -211,6 +213,7 @@ def save_backtest_artifacts(
     symbols: list[str],
     timeframe_minutes: int,
     strategy_name: str,
+    periods_per_year: float | None = None,
 ) -> None:
     output_dir = PROJECT_ROOT / "outputs" / "backtests"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -225,6 +228,11 @@ def save_backtest_artifacts(
     for key, value in asdict(config).items():
         print(f"- {key}: {value}")
     print(f"\nTrade log: {trades_path}")
+    if periods_per_year and len(result.equity_curve) > 1:
+        summary = summarize(result.equity_curve, periods_per_year)
+        _, report_html = write_report(output_dir, f"{output_name}_{timestamp}_report",
+                                      f"{strategy_name} backtest ({timeframe_minutes}m)", result.equity_curve, summary)
+        print(f"Report: {report_html}")
 
 
 def save_optimization_artifacts(
@@ -235,6 +243,7 @@ def save_optimization_artifacts(
     timeframe_minutes: int,
     top: int,
     strategy_name: str,
+    periods_per_year: float | None = None,
 ) -> None:
     output_dir = PROJECT_ROOT / "outputs" / "optimizations"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -299,6 +308,18 @@ def save_optimization_artifacts(
     print(best_result.summary())
     print(f"\nSummary CSV: {summary_path}")
     print(f"Best trade log: {best_trades_path}")
+    if periods_per_year and len(best_result.equity_curve) > 1 and "sharpe" in results_df.columns:
+        # Deflate the winner's Sharpe by every configuration that was tried.
+        trial_sharpes = (results_df["sharpe"].astype(float) / periods_per_year**0.5).tolist()
+        summary = summarize(best_result.equity_curve, periods_per_year,
+                            n_trials=len(trial_sharpes), trial_sharpes_per_period=trial_sharpes)
+        _, report_html = write_report(
+            output_dir, f"{strategy_name}_best_{timeframe_minutes}m_{timestamp}_report",
+            f"{strategy_name} optimisation winner ({timeframe_minutes}m)", best_result.equity_curve, summary,
+            ValidationSummary(n_trials=len(trial_sharpes)),
+        )
+        print(f"Deflated Sharpe of the winner: {summary.dsr:.1%} over {len(trial_sharpes)} configurations")
+        print(f"Report: {report_html}")
 
 
 def main() -> None:
@@ -389,6 +410,7 @@ def main() -> None:
             timeframe_minutes=args.timeframe,
             top=args.top,
             strategy_name=args.strategy,
+            periods_per_year=bar_factor,
         )
     else:
         if args.strategy == "evidence_momentum":
@@ -418,6 +440,7 @@ def main() -> None:
             symbols=symbols,
             timeframe_minutes=args.timeframe,
             strategy_name=args.strategy,
+            periods_per_year=bar_factor,
         )
 
     print(

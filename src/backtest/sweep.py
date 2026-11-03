@@ -224,3 +224,66 @@ def rank_sweep_results(results: pd.DataFrame) -> pd.DataFrame:
     ).reset_index(drop=True)
     ranked.insert(0, "rank", range(1, len(ranked) + 1))
     return ranked
+
+
+@dataclass(frozen=True)
+class OverfittingDiagnostics:
+    """Selection-bias checks for a finished sweep."""
+
+    n_trials: int
+    best_label: str
+    deflated_sharpe: float
+    cpcv: dict
+    pbo: float | None
+    trial_sharpes_per_period: list[float]
+
+
+def overfitting_diagnostics(
+    equity_by_label: dict[str, pd.Series],
+    best_label: str,
+    bars_per_year: float,
+    n_groups: int = 6,
+    n_test_groups: int = 2,
+    purge_bars: int | None = None,
+    embargo_bars: int | None = None,
+    pbo_blocks: int = 10,
+) -> OverfittingDiagnostics:
+    """Deflated Sharpe of the chosen configuration, CPCV out-of-sample
+    distribution and probability of backtest overfitting, from the full-period
+    equity curves of every configuration that was tried.
+
+    Defaults: purge = two sessions of bars (no strategy here holds longer
+    without an exit check), embargo = 1% of the sample.
+    """
+    # Local imports keep the sweep helpers importable without the analytics stack.
+    from src.analytics.metrics import deflated_sharpe_ratio, per_period_sharpe
+    from src.validation.cpcv import (
+        CombinatorialPurgedKFold,
+        cpcv_select_and_evaluate,
+        probability_of_backtest_overfitting,
+        returns_matrix,
+    )
+
+    if best_label not in equity_by_label:
+        raise KeyError(best_label)
+    matrix = returns_matrix(equity_by_label)
+    n_obs = len(matrix)
+    bars_per_session = max(1, round(bars_per_year / 252))
+    purge = 2 * bars_per_session if purge_bars is None else purge_bars
+    embargo = max(1, n_obs // 100) if embargo_bars is None else embargo_bars
+
+    trial_sharpes = [per_period_sharpe(matrix[column]) for column in matrix.columns]
+    dsr = deflated_sharpe_ratio(matrix[best_label], n_trials=len(trial_sharpes), trial_sharpes_per_period=trial_sharpes)
+
+    cv = CombinatorialPurgedKFold(n_groups=n_groups, n_test_groups=n_test_groups,
+                                  purge_periods=purge, embargo_periods=embargo)
+    cpcv = cpcv_select_and_evaluate(matrix, cv).summary(bars_per_year)
+    pbo = probability_of_backtest_overfitting(matrix, n_blocks=pbo_blocks).pbo if matrix.shape[1] > 1 else None
+    return OverfittingDiagnostics(
+        n_trials=len(trial_sharpes),
+        best_label=best_label,
+        deflated_sharpe=float(dsr),
+        cpcv=cpcv,
+        pbo=pbo,
+        trial_sharpes_per_period=trial_sharpes,
+    )

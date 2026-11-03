@@ -37,6 +37,25 @@ from typing import Iterable
 
 import numpy as np
 import pandas as pd
+
+from src.backtest.execution_model import (
+    ExecutionModel,
+    decision_view,
+    require_columns,
+    sigma_proxy,
+    stop_fill_reference,
+)
+
+DECISION_COLUMNS = (
+    "atr",
+    "bb_mid",
+    "rsi",
+    "zscore",
+    "long_entry_setup",
+    "long_exit_signal",
+    "short_entry_setup",
+    "short_exit_signal",
+)
 from loguru import logger
 
 
@@ -408,8 +427,13 @@ def backtest_mean_reversion_portfolio(
     commission_bps: float = 1.0,
     slippage_bps: float = 2.0,
     bars_per_year_value: float = 252.0 * 6.5,
+    execution: ExecutionModel | None = None,
 ) -> BacktestResult:
     """Run the portfolio backtest across all supplied symbols.
+
+    Timing: entry setups, exit signals, z-scores and ATR are read from the
+    previous bar (``prev_*`` columns) and filled at the current bar's open.
+    Stops and targets fire inside the bar; gaps fill at the open.
 
     Architecture notes:
         - the engine supports long-only or long+short mode via `allow_short`
@@ -428,6 +452,8 @@ def backtest_mean_reversion_portfolio(
         frame = build_indicator_frame(bars, proxy_bars=proxy_bars, config=config).reset_index(drop=False)
         if "timestamp" not in frame.columns:
             frame = frame.rename(columns={frame.columns[0]: "timestamp"})
+        require_columns(frame, ["open", "high", "low", "close"])
+        frame = decision_view(frame, DECISION_COLUMNS)
         frames[symbol] = frame
         latest_prices[symbol] = float(frame["close"].iloc[0])
         events.extend(
@@ -446,7 +472,19 @@ def backtest_mean_reversion_portfolio(
             circuit_breaker_triggered=False,
         )
 
-    cost_per_side = (commission_bps + slippage_bps) / 10_000.0
+    model = execution or ExecutionModel.from_legacy(commission_bps, slippage_bps)
+    est_cost = (commission_bps + slippage_bps) / 10_000.0
+
+    def bar_context(row: pd.Series, reference: float) -> dict:
+        volume = row.get("volume")
+        atr_value = row.get("atr")
+        return {
+            "high": float(row["high"]),
+            "low": float(row["low"]),
+            "bar_volume": float(volume) if volume is not None and pd.notna(volume) else None,
+            "sigma_bar": sigma_proxy(float(atr_value) if atr_value is not None and pd.notna(atr_value) else None, reference),
+        }
+
     cash = starting_cash
     positions: dict[str, OpenPosition] = {}
     trades: list[dict] = []
@@ -477,7 +515,7 @@ def backtest_mean_reversion_portfolio(
     for timestamp in sorted(event_groups):
         symbol_events = event_groups[timestamp]
         for symbol, idx in symbol_events:
-            latest_prices[symbol] = float(frames[symbol].iloc[idx]["close"])
+            latest_prices[symbol] = float(frames[symbol].iloc[idx]["open"])
 
         equity_before_entries = portfolio_equity()
         peak_equity = max(peak_equity, equity_before_entries)
@@ -492,9 +530,9 @@ def backtest_mean_reversion_portfolio(
                 continue
 
             row = frames[symbol].iloc[idx]
+            open_price = float(row["open"])
             high = float(row["high"])
             low = float(row["low"])
-            close = float(row["close"])
             position.holding_bars += 1
             position.highest_high = max(position.highest_high, high)
             position.lowest_low = min(position.lowest_low, low)
@@ -505,40 +543,30 @@ def backtest_mean_reversion_portfolio(
 
             # Preserve the pessimistic assumption: if the stop and target are
             # both touched intrabar, the stop is assumed to fire first.
+            # Decisions taken on the previous close (signal or time exit)
+            # execute at this open, before anything inside the bar.
             if position.side == 1:
-                if low <= position.stop_price:
-                    exit_trigger = position.stop_price
-                    reported_exit_price = position.stop_price
+                if bool(row["prev_long_exit_signal"]):
+                    exit_trigger, reason = open_price, "SIGNAL"
+                elif position.holding_bars > config.max_holding_bars:
+                    exit_trigger, reason = open_price, "TIME"
+                elif low <= position.stop_price:
+                    exit_trigger = stop_fill_reference(1, open_price, position.stop_price, "stop")
                     reason = "STOP"
                 elif high >= position.target_price:
-                    exit_trigger = position.target_price
-                    reported_exit_price = position.target_price
+                    exit_trigger = stop_fill_reference(1, open_price, position.target_price, "target")
                     reason = "TARGET"
-                elif bool(row["long_exit_signal"]):
-                    exit_trigger = close
-                    reported_exit_price = close * (1 - cost_per_side)
-                    reason = "SIGNAL"
-                elif position.holding_bars >= config.max_holding_bars:
-                    exit_trigger = close
-                    reported_exit_price = close * (1 - cost_per_side)
-                    reason = "TIME"
             else:
-                if high >= position.stop_price:
-                    exit_trigger = position.stop_price
-                    reported_exit_price = position.stop_price
+                if bool(row["prev_short_exit_signal"]):
+                    exit_trigger, reason = open_price, "SIGNAL"
+                elif position.holding_bars > config.max_holding_bars:
+                    exit_trigger, reason = open_price, "TIME"
+                elif high >= position.stop_price:
+                    exit_trigger = stop_fill_reference(-1, open_price, position.stop_price, "stop")
                     reason = "STOP"
                 elif low <= position.target_price:
-                    exit_trigger = position.target_price
-                    reported_exit_price = position.target_price
+                    exit_trigger = stop_fill_reference(-1, open_price, position.target_price, "target")
                     reason = "TARGET"
-                elif bool(row["short_exit_signal"]):
-                    exit_trigger = close
-                    reported_exit_price = close * (1 + cost_per_side)
-                    reason = "SIGNAL"
-                elif position.holding_bars >= config.max_holding_bars:
-                    exit_trigger = close
-                    reported_exit_price = close * (1 + cost_per_side)
-                    reason = "TIME"
 
             if exit_trigger is None:
                 current_atr = float(row["atr"])
@@ -577,17 +605,19 @@ def backtest_mean_reversion_portfolio(
                         position.target_price = min(position.target_price, mean_target, atr_target)
                 continue
 
+            exit_fill = model.fill(-position.side, exit_trigger, position.qty, **bar_context(row, exit_trigger))
+            reported_exit_price = exit_fill.price
             if position.side == 1:
-                proceeds = position.qty * exit_trigger * (1 - cost_per_side)
+                proceeds = position.qty * exit_fill.price
                 pnl = proceeds - (position.qty * position.entry_price)
                 cash += proceeds
-                pnl_pct = (exit_trigger / position.entry_price) - 1
+                pnl_pct = (exit_fill.price / position.entry_price) - 1
                 logged_side = "LONG"
             else:
-                cover_cost = position.qty * exit_trigger * (1 + cost_per_side)
+                cover_cost = position.qty * exit_fill.price
                 pnl = (position.qty * position.entry_price) - cover_cost
                 cash -= cover_cost
-                pnl_pct = (position.entry_price - (exit_trigger * (1 + cost_per_side))) / position.entry_price
+                pnl_pct = (position.entry_price - exit_fill.price) / position.entry_price
                 logged_side = "SHORT"
             trades.append(
                 {
@@ -614,17 +644,17 @@ def backtest_mean_reversion_portfolio(
                     continue
                 row = frames[symbol].iloc[idx]
                 required_values = [
-                    row.get("atr"),
-                    row.get("bb_mid"),
-                    row.get("rsi"),
-                    row.get("zscore"),
+                    row.get("prev_atr"),
+                    row.get("prev_bb_mid"),
+                    row.get("prev_rsi"),
+                    row.get("prev_zscore"),
                 ]
                 if any(pd.isna(value) for value in required_values):
                     continue
-                zscore_value = float(row["zscore"])
-                if bool(row["long_entry_setup"]):
+                zscore_value = float(row["prev_zscore"])
+                if bool(row["prev_long_entry_setup"]):
                     entry_candidates.append((abs(zscore_value), symbol, idx, 1))
-                if config.allow_short and bool(row["short_entry_setup"]):
+                if config.allow_short and bool(row["prev_short_entry_setup"]):
                     entry_candidates.append((abs(zscore_value), symbol, idx, -1))
 
         # Larger absolute z-score = more compelling mean-reversion setup.
@@ -635,17 +665,17 @@ def backtest_mean_reversion_portfolio(
                 continue
 
             row = frames[symbol].iloc[idx]
-            close = float(row["close"])
+            open_price = float(row["open"])
             high = float(row["high"])
             low = float(row["low"])
-            atr = float(row["atr"])
-            if not np.isfinite(atr) or atr <= 0 or close <= 0:
+            atr = float(row["prev_atr"])
+            if not np.isfinite(atr) or atr <= 0 or open_price <= 0:
                 continue
 
             equity = portfolio_equity()
             current_gross_exposure = gross_exposure()
             available_notional = max((equity * config.max_gross_exposure_pct) - current_gross_exposure, 0.0)
-            entry_price = close * (1 + cost_per_side) if side == 1 else close * (1 - cost_per_side)
+            est_price = open_price * (1 + est_cost) if side == 1 else open_price * (1 - est_cost)
 
             # ATR sizing:
             #   risk_budget = equity * risk_per_trade_pct
@@ -654,28 +684,29 @@ def backtest_mean_reversion_portfolio(
             # This keeps the expected loss of each trade roughly stable even
             # when one symbol is placid and another is chaotic.
             risk_budget = equity * config.risk_per_trade_pct
-            per_share_risk = (config.atr_stop_mult * atr) + (entry_price * (2 * cost_per_side))
+            per_share_risk = (config.atr_stop_mult * atr) + (est_price * (2 * est_cost))
             qty_by_risk = floor(risk_budget / per_share_risk) if per_share_risk > 0 else 0
-            qty_by_position_cap = floor((equity * config.max_position_pct) / entry_price)
+            qty_by_position_cap = floor((equity * config.max_position_pct) / est_price)
             if side == 1:
-                qty_by_available_cash = floor(min(cash, available_notional) / entry_price)
+                qty_by_available_cash = floor(min(cash, available_notional) / est_price)
             else:
-                qty_by_available_cash = floor(available_notional / max(close, 1e-9))
+                qty_by_available_cash = floor(available_notional / max(open_price, 1e-9))
             qty = max(min(qty_by_risk, qty_by_position_cap, qty_by_available_cash), 0)
             if qty <= 0:
                 continue
+            entry_price = model.fill(side, open_price, qty, **bar_context(row, open_price)).price
 
             if side == 1:
                 cash -= qty * entry_price
                 initial_stop = entry_price - (config.atr_stop_mult * atr)
                 atr_target = entry_price + (config.atr_target_mult * atr)
-                mean_target = float(row["bb_mid"]) + (config.mean_exit_atr_buffer * atr)
+                mean_target = float(row["prev_bb_mid"]) + (config.mean_exit_atr_buffer * atr)
                 target_price = max(atr_target, mean_target)
             else:
                 cash += qty * entry_price
                 initial_stop = entry_price + (config.atr_stop_mult * atr)
                 atr_target = entry_price - (config.atr_target_mult * atr)
-                mean_target = float(row["bb_mid"]) - (config.mean_exit_atr_buffer * atr)
+                mean_target = float(row["prev_bb_mid"]) - (config.mean_exit_atr_buffer * atr)
                 target_price = min(atr_target, mean_target)
             positions[symbol] = OpenPosition(
                 symbol=symbol,
@@ -691,6 +722,8 @@ def backtest_mean_reversion_portfolio(
                 lowest_low=low,
             )
 
+        for symbol, idx in symbol_events:
+            latest_prices[symbol] = float(frames[symbol].iloc[idx]["close"])
         equity = portfolio_equity()
         equity_curve.append(equity)
         equity_index.append(timestamp)
@@ -702,14 +735,15 @@ def backtest_mean_reversion_portfolio(
         final_bar = frame.iloc[-1]
         final_time = final_bar["timestamp"]
         final_close = float(final_bar["close"])
+        final_effective_exit = model.fill(
+            -position.side, final_close, position.qty, **bar_context(final_bar, final_close)
+        ).price
         if position.side == 1:
-            final_effective_exit = final_close * (1 - cost_per_side)
             pnl = (position.qty * final_effective_exit) - (position.qty * position.entry_price)
             cash += position.qty * final_effective_exit
-            pnl_pct = (final_close / position.entry_price) - 1
+            pnl_pct = (final_effective_exit / position.entry_price) - 1
             logged_side = "LONG"
         else:
-            final_effective_exit = final_close * (1 + cost_per_side)
             pnl = (position.qty * position.entry_price) - (position.qty * final_effective_exit)
             cash -= position.qty * final_effective_exit
             pnl_pct = (position.entry_price - final_effective_exit) / position.entry_price

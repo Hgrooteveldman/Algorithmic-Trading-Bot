@@ -21,10 +21,13 @@ from src.backtest.sweep import (
     SweepConfig,
     bars_per_year_for_timeframe,
     generate_sweep_configs,
+    overfitting_diagnostics,
     rank_sweep_results,
     sample_sweep_configs,
     sweep_result_row,
 )
+from src.analytics.metrics import summarize
+from src.analytics.report import ValidationSummary, write_report
 from src.broker.alpaca_client import _to_alpaca_timeframe
 
 
@@ -77,6 +80,10 @@ def parse_args() -> argparse.Namespace:
         default=0.02,
         help="Minimum out-of-sample average exposure required for paper-candidate ranking",
     )
+    parser.add_argument("--cv-groups", type=int, default=6, help="CPCV: number of contiguous groups")
+    parser.add_argument("--cv-test-groups", type=int, default=2, help="CPCV: groups held out per split")
+    parser.add_argument("--purge-bars", type=int, default=None, help="CPCV purge (default: two sessions of bars)")
+    parser.add_argument("--embargo-bars", type=int, default=None, help="CPCV embargo (default: 1%% of the sample)")
     return parser.parse_args()
 
 
@@ -302,6 +309,50 @@ def main() -> None:
     best_overrides_path = output_dir / f"best_{best_config.label()}_{timestamp}.env"
     best_overrides = config_env_overrides(best_config)
     best_overrides_path.write_text("\n".join(best_overrides) + "\n", encoding="utf-8")
+
+    # --- Selection-bias checks on the whole sweep (per timeframe of the winner) ---
+    best_tf = best_config.timeframe_minutes
+    bars_per_year = bars_per_year_for_timeframe(best_tf)
+    equity_by_label = {
+        label: entry[1].equity_curve
+        for label, entry in results_by_label.items()
+        if entry[0].timeframe_minutes == best_tf and len(entry[1].equity_curve) > 1
+    }
+    diagnostics = overfitting_diagnostics(
+        equity_by_label,
+        best_label=best_config.label(),
+        bars_per_year=bars_per_year,
+        n_groups=args.cv_groups,
+        n_test_groups=args.cv_test_groups,
+        purge_bars=args.purge_bars,
+        embargo_bars=args.embargo_bars,
+    )
+    summary = summarize(
+        best_result.equity_curve,
+        bars_per_year,
+        n_trials=diagnostics.n_trials,
+        trial_sharpes_per_period=diagnostics.trial_sharpes_per_period,
+    )
+    report_md, report_html = write_report(
+        output_dir,
+        name=f"report_{best_config.label()}_{timestamp}",
+        title=f"Sweep winner: {best_config.label()}",
+        equity=best_result.equity_curve,
+        summary=summary,
+        validation=ValidationSummary(n_trials=diagnostics.n_trials, cpcv=diagnostics.cpcv, pbo=diagnostics.pbo),
+    )
+
+    print("\n=== Overfitting checks ===")
+    print(f"Configurations tried (timeframe {best_tf}m): {diagnostics.n_trials}")
+    print(f"Deflated Sharpe of the winner: {diagnostics.deflated_sharpe:.1%}  (>95% = evidence of skill)")
+    print(
+        f"CPCV OOS Sharpe: median {diagnostics.cpcv['oos_sharpe_median']:.2f}, "
+        f"10th pct {diagnostics.cpcv['oos_sharpe_p10']:.2f}, "
+        f"positive in {diagnostics.cpcv['share_paths_positive']:.0%} of {diagnostics.cpcv['n_paths']} paths"
+    )
+    if diagnostics.pbo is not None:
+        print(f"Probability of backtest overfitting: {diagnostics.pbo:.0%}")
+    print(f"Report: {report_html}")
 
     print("\n=== Top Configurations ===")
     columns = [

@@ -1,13 +1,14 @@
 """Event-driven backtester for the default trend strategy.
 
 Limits to be aware of (read these before trusting any result):
-    - Fills happen at the close of the signal bar with a flat slippage cost.
-      Real markets have variable slippage that depends on size and volatility.
+    - Signals are evaluated on a bar's close and filled at the NEXT bar's
+      open (see src/backtest/execution_model.py). No fill ever uses the
+      close that produced its own signal.
+    - Friction per fill = fee tier + half spread (range-based proxy, with a
+      floor) + linear market impact on participation of bar volume.
     - Stop and target are checked against the bar's high/low, ignoring
       intra-bar path. If both are hit in the same bar, we pessimistically
-      assume the stop fired first.
-    - Commissions modelled as a flat basis-point cost per side. Alpaca's
-      stock commissions are zero, but slippage and bid/ask spread are real.
+      assume the stop fired first. Gaps through a level fill at the open.
     - No survivorship bias correction, no dividend/corporate-action handling.
     - A profitable backtest is NECESSARY but NOT SUFFICIENT. Validate with
       out-of-sample data, walk-forward analysis, and weeks of paper trading
@@ -21,6 +22,14 @@ from typing import List
 
 import numpy as np
 import pandas as pd
+
+from src.backtest.execution_model import (
+    ExecutionModel,
+    FillResult,
+    require_columns,
+    sigma_proxy,
+    stop_fill_reference,
+)
 
 from src.strategy.base import Signal
 from src.strategy.sma_crossover import (
@@ -115,6 +124,54 @@ def _result_from_components(
     )
 
 
+def _bar_context(bar: pd.Series) -> dict:
+    """Fields the execution model needs from one bar."""
+    open_price = float(bar["open"])
+    atr = bar.get("atr")
+    atr_value = float(atr) if atr is not None and pd.notna(atr) else None
+    volume = bar.get("volume")
+    return {
+        "high": float(bar["high"]),
+        "low": float(bar["low"]),
+        "bar_volume": float(volume) if volume is not None and pd.notna(volume) else None,
+        "sigma_bar": sigma_proxy(atr_value, open_price),
+    }
+
+
+def _trade_record(
+    *,
+    entry_time,
+    exit_time,
+    entry_fill: FillResult,
+    exit_fill: FillResult,
+    qty: int,
+    hold_bars: int,
+    reason: str,
+    symbol: str | None = None,
+) -> dict:
+    record = {
+        "entry_time": entry_time,
+        "exit_time": exit_time,
+        "entry": entry_fill.price,
+        "exit": exit_fill.price,
+        "qty": qty,
+        "pnl": qty * (exit_fill.price - entry_fill.price),
+        "pnl_pct": (exit_fill.price / entry_fill.price) - 1,
+        "hold_bars": hold_bars,
+        "reason": reason,
+        "entry_cost_bps": entry_fill.total_cost_bps,
+        "exit_cost_bps": exit_fill.total_cost_bps,
+    }
+    if symbol is not None:
+        record = {"symbol": symbol, **record}
+    return record
+
+
+def _position_fraction(risk_per_trade_pct: float, stop_loss_pct: float, est_cost: float, max_position_pct: float) -> float:
+    effective_stop_pct = stop_loss_pct + (2 * est_cost)
+    return min(risk_per_trade_pct / max(effective_stop_pct, 1e-9), max_position_pct)
+
+
 def backtest_sma(
     bars: pd.DataFrame,
     starting_cash: float = 100_000.0,
@@ -137,7 +194,15 @@ def backtest_sma(
     max_position_pct: float = 0.10,
     risk_per_trade_pct: float = 0.0015,
     bars_per_year: int = 252 * 78,  # ~5-min bars in a US trading year
+    execution: ExecutionModel | None = None,
 ) -> BacktestResult:
+    """Single-symbol backtest.
+
+    Timing: the signal is evaluated on bar ``i``'s close and executed at bar
+    ``i+1``'s open. Stops and targets are checked from the fill bar onward,
+    with gaps through a level filled at the open.
+    """
+    require_columns(bars, ["open", "high", "low", "close"])
     df = build_signal_frame(
         bars=bars,
         short=short_window,
@@ -148,20 +213,18 @@ def backtest_sma(
         atr_window=atr_window,
     ).reset_index(drop=False)
 
-    cost_per_side = (commission_bps + slippage_bps) / 10_000
-    effective_stop_pct = stop_loss_pct + (2 * cost_per_side)
-    target_position_pct = min(
-        risk_per_trade_pct / max(effective_stop_pct, 1e-9),
-        max_position_pct,
-    )
+    model = execution or ExecutionModel.from_legacy(commission_bps, slippage_bps)
+    est_cost = (commission_bps + slippage_bps) / 10_000
+    target_position_pct = _position_fraction(risk_per_trade_pct, stop_loss_pct, est_cost, max_position_pct)
 
     cash = starting_cash
     qty = 0
-    entry_price = 0.0
+    entry_fill: FillResult | None = None
     stop = 0.0
     target = 0.0
     entry_time = None
     entry_index = 0
+    pending: str | None = None  # "BUY" or "SELL", decided on the previous bar
 
     equity_curve: List[float] = []
     equity_index: List = []
@@ -171,40 +234,47 @@ def backtest_sma(
     for i in range(1, len(df)):
         bar = df.iloc[i]
         timestamp = bar["timestamp"] if "timestamp" in bar else bar.name
+        open_price = float(bar["open"])
         price = float(bar["close"])
         high, low = float(bar["high"]), float(bar["low"])
+        context = _bar_context(bar)
 
-        # --- 1) Manage the open position first ---
-        if qty > 0:
+        # --- 1) Execute yesterday's decision at today's open ---
+        if pending == "BUY" and qty == 0:
+            qty = int((cash * target_position_pct) // (open_price * (1 + est_cost)))
+            if qty > 0:
+                entry_fill = model.fill(1, open_price, qty, **context)
+                cash -= qty * entry_fill.price
+                stop = round(entry_fill.price * (1 - stop_loss_pct), 2)
+                target = round(entry_fill.price * (1 + take_profit_pct), 2)
+                entry_time = timestamp
+                entry_index = i
+        elif pending == "SELL" and qty > 0 and entry_fill is not None:
+            exit_fill = model.fill(-1, open_price, qty, **context)
+            cash += qty * exit_fill.price
+            trades.append(_trade_record(entry_time=entry_time, exit_time=timestamp, entry_fill=entry_fill,
+                                        exit_fill=exit_fill, qty=qty, hold_bars=i - entry_index, reason="SIGNAL"))
+            qty = 0
+        pending = None
+
+        # --- 2) Manage the open position inside the bar ---
+        if qty > 0 and entry_fill is not None:
             bars_in_market += 1
-            exit_price = None
+            reference = None
             reason = ""
             # Pessimistic assumption: if both touched, stop fires first.
             if low <= stop:
-                exit_price, reason = stop, "STOP"
+                reference, reason = stop_fill_reference(1, open_price, stop, "stop"), "STOP"
             elif high >= target:
-                exit_price, reason = target, "TARGET"
-            if exit_price is not None:
-                proceeds = qty * exit_price * (1 - cost_per_side)
-                cost_basis = qty * entry_price
-                pnl = proceeds - cost_basis
-                cash += proceeds
-                trades.append(
-                    {
-                        "entry_time": entry_time,
-                        "exit_time": timestamp,
-                        "entry": entry_price,
-                        "exit": exit_price,
-                        "qty": qty,
-                        "pnl": pnl,
-                        "pnl_pct": (exit_price / entry_price) - 1,
-                        "hold_bars": i - entry_index,
-                        "reason": reason,
-                    }
-                )
+                reference, reason = stop_fill_reference(1, open_price, target, "target"), "TARGET"
+            if reference is not None:
+                exit_fill = model.fill(-1, reference, qty, **context)
+                cash += qty * exit_fill.price
+                trades.append(_trade_record(entry_time=entry_time, exit_time=timestamp, entry_fill=entry_fill,
+                                            exit_fill=exit_fill, qty=qty, hold_bars=i - entry_index, reason=reason))
                 qty = 0
 
-        # --- 2) Generate new entries / exits on signals ---
+        # --- 3) Decide on this bar's close; executed at the next open ---
         signal = signal_for_index(
             df,
             idx=i,
@@ -212,82 +282,37 @@ def backtest_sma(
             min_atr_pct=min_atr_pct,
             max_atr_pct=max_atr_pct,
         )
-        strength_score = relative_strength_score(
-            df,
-            idx=i,
-            lookback_bars=relative_strength_lookback,
-        )
-        strength_snapshot = (
-            RelativeStrengthSnapshot(score=strength_score, rank=1)
-            if strength_score is not None
-            else None
-        )
-
         if signal == Signal.BUY and qty == 0:
-            if not passes_relative_strength_filter(
+            strength_score = relative_strength_score(df, idx=i, lookback_bars=relative_strength_lookback)
+            strength_snapshot = (
+                RelativeStrengthSnapshot(score=strength_score, rank=1) if strength_score is not None else None
+            )
+            if passes_relative_strength_filter(
                 strength_snapshot,
                 max_rank=max_relative_strength_rank,
                 min_return=min_relative_strength_return,
             ):
-                continue
-            entry_price = price * (1 + cost_per_side)
-            qty = int((cash * target_position_pct) // entry_price)
-            if qty > 0:
-                cash -= qty * entry_price
-                stop = round(entry_price * (1 - stop_loss_pct), 2)
-                target = round(entry_price * (1 + take_profit_pct), 2)
-                entry_time = timestamp
-                entry_index = i
+                pending = "BUY"
         elif signal == Signal.SELL and qty > 0:
-            exit_price = price * (1 - cost_per_side)
-            cash += qty * exit_price
-            trades.append(
-                {
-                    "entry_time": entry_time,
-                    "exit_time": timestamp,
-                    "entry": entry_price,
-                    "exit": exit_price,
-                    "qty": qty,
-                    "pnl": qty * (exit_price - entry_price),
-                    "pnl_pct": (exit_price / entry_price) - 1,
-                    "hold_bars": i - entry_index,
-                    "reason": "SIGNAL",
-                }
-            )
-            qty = 0
+            pending = "SELL"
 
         equity_curve.append(cash + qty * price)
         equity_index.append(timestamp)
 
-    if qty > 0 and len(df):
+    if qty > 0 and len(df) and entry_fill is not None:
         final_bar = df.iloc[-1]
         final_time = final_bar["timestamp"] if "timestamp" in final_bar else final_bar.name
-        final_price = float(final_bar["close"]) * (1 - cost_per_side)
-        cash += qty * final_price
-        trades.append(
-            {
-                "entry_time": entry_time,
-                "exit_time": final_time,
-                "entry": entry_price,
-                "exit": final_price,
-                "qty": qty,
-                "pnl": qty * (final_price - entry_price),
-                "pnl_pct": (final_price / entry_price) - 1,
-                "hold_bars": max(len(df) - 1 - entry_index, 0),
-                "reason": "END",
-            }
-        )
+        exit_fill = model.fill(-1, float(final_bar["close"]), qty, **_bar_context(final_bar))
+        cash += qty * exit_fill.price
+        trades.append(_trade_record(entry_time=entry_time, exit_time=final_time, entry_fill=entry_fill,
+                                    exit_fill=exit_fill, qty=qty, hold_bars=max(len(df) - 1 - entry_index, 0),
+                                    reason="END"))
         qty = 0
         if equity_curve:
             equity_curve[-1] = cash
 
-    # --- Metrics ---
     equity = pd.Series(equity_curve, index=equity_index)
-    buy_and_hold_return = (
-        df["close"].iloc[-1] / df["close"].iloc[0] - 1
-        if len(df) > 1
-        else 0.0
-    )
+    buy_and_hold_return = df["close"].iloc[-1] / df["close"].iloc[0] - 1 if len(df) > 1 else 0.0
     trades_df = pd.DataFrame(trades)
     exposure_pct = bars_in_market / max(len(df) - 1, 1) if len(df) else 0.0
 
@@ -325,7 +350,11 @@ def backtest_portfolio(
     max_open_positions: int = 4,
     risk_per_trade_pct: float = 0.0015,
     bars_per_year: int = 252 * 78,
+    execution: ExecutionModel | None = None,
 ) -> BacktestResult:
+    """Multi-symbol backtest with the same next-open timing as
+    :func:`backtest_sma`: decisions on bar ``t``'s close, fills at ``t+1``'s
+    open, intrabar stops/targets with gap handling."""
     frames: dict[str, pd.DataFrame] = {}
     events: list[tuple[pd.Timestamp, str, int]] = []
     latest_prices: dict[str, float] = {}
@@ -333,6 +362,7 @@ def backtest_portfolio(
     for symbol, bars in bars_by_symbol.items():
         if bars.empty:
             continue
+        require_columns(bars, ["open", "high", "low", "close"])
         frame = build_signal_frame(
             bars=bars,
             short=short_window,
@@ -346,19 +376,12 @@ def backtest_portfolio(
             frame = frame.rename(columns={frame.columns[0]: "timestamp"})
         frames[symbol] = frame
         latest_prices[symbol] = float(frame["close"].iloc[0])
-        events.extend(
-            [
-                (frame.iloc[idx]["timestamp"], symbol, idx)
-                for idx in range(1, len(frame))
-            ]
-        )
+        events.extend((frame.iloc[idx]["timestamp"], symbol, idx) for idx in range(1, len(frame)))
 
     if not events:
-        empty_series = pd.Series(dtype=float)
-        empty_trades = pd.DataFrame()
         return _result_from_components(
-            equity=empty_series,
-            trades_df=empty_trades,
+            equity=pd.Series(dtype=float),
+            trades_df=pd.DataFrame(),
             starting_cash=starting_cash,
             buy_and_hold_return=0.0,
             exposure_pct=0.0,
@@ -366,15 +389,14 @@ def backtest_portfolio(
         )
 
     events.sort(key=lambda item: (item[0], item[1]))
-    cost_per_side = (commission_bps + slippage_bps) / 10_000
-    effective_stop_pct = stop_loss_pct + (2 * cost_per_side)
-    target_position_pct = min(
-        risk_per_trade_pct / max(effective_stop_pct, 1e-9),
-        max_position_pct,
-    )
+    model = execution or ExecutionModel.from_legacy(commission_bps, slippage_bps)
+    est_cost = (commission_bps + slippage_bps) / 10_000
+    target_position_pct = _position_fraction(risk_per_trade_pct, stop_loss_pct, est_cost, max_position_pct)
 
     cash = starting_cash
     positions: dict[str, dict] = {}
+    pending_sells: set[str] = set()
+    pending_buys: list[str] = []  # ranked, decided on the previous bar
     trades: list[dict] = []
     equity_curve: list[float] = []
     equity_index: list[pd.Timestamp] = []
@@ -382,13 +404,13 @@ def backtest_portfolio(
 
     def portfolio_equity() -> float:
         return cash + sum(
-            position["qty"] * latest_prices.get(symbol, position["entry_price"])
+            position["qty"] * latest_prices.get(symbol, position["entry_fill"].price)
             for symbol, position in positions.items()
         )
 
     def portfolio_gross_exposure() -> float:
         return sum(
-            position["qty"] * latest_prices.get(symbol, position["entry_price"])
+            position["qty"] * latest_prices.get(symbol, position["entry_fill"].price)
             for symbol, position in positions.items()
         )
 
@@ -398,9 +420,81 @@ def backtest_portfolio(
 
     for timestamp in sorted(event_groups):
         symbol_events = event_groups[timestamp]
+        idx_by_symbol = {symbol: idx for symbol, idx in symbol_events}
+
+        # --- 1) Execute the previous bar's decisions at this bar's open ---
+        for symbol in sorted(pending_sells):
+            idx = idx_by_symbol.get(symbol)
+            position = positions.get(symbol)
+            if idx is None or position is None:
+                continue
+            bar = frames[symbol].iloc[idx]
+            exit_fill = model.fill(-1, float(bar["open"]), position["qty"], **_bar_context(bar))
+            cash += position["qty"] * exit_fill.price
+            trades.append(_trade_record(symbol=symbol, entry_time=position["entry_time"], exit_time=timestamp,
+                                        entry_fill=position["entry_fill"], exit_fill=exit_fill, qty=position["qty"],
+                                        hold_bars=idx - position["entry_index"], reason="SIGNAL"))
+            positions.pop(symbol)
+        pending_sells = {s for s in pending_sells if s not in idx_by_symbol and s in positions}
+
+        for symbol, idx in symbol_events:
+            latest_prices[symbol] = float(frames[symbol].iloc[idx]["open"])
+
+        carried_buys: list[str] = []
+        for symbol in pending_buys:
+            idx = idx_by_symbol.get(symbol)
+            if idx is None:
+                carried_buys.append(symbol)
+                continue
+            if symbol in positions or len(positions) >= max_open_positions:
+                continue
+            bar = frames[symbol].iloc[idx]
+            open_price = float(bar["open"])
+            equity = portfolio_equity()
+            available_notional = max((equity * max_gross_exposure_pct) - portfolio_gross_exposure(), 0.0)
+            desired_notional = min(equity * target_position_pct, available_notional, cash)
+            qty = int(desired_notional // (open_price * (1 + est_cost)))
+            if qty <= 0:
+                continue
+            entry_fill = model.fill(1, open_price, qty, **_bar_context(bar))
+            cash -= qty * entry_fill.price
+            positions[symbol] = {
+                "qty": qty,
+                "entry_fill": entry_fill,
+                "stop": round(entry_fill.price * (1 - stop_loss_pct), 2),
+                "target": round(entry_fill.price * (1 + take_profit_pct), 2),
+                "entry_time": timestamp,
+                "entry_index": idx,
+            }
+        pending_buys = carried_buys
+
         for symbol, idx in symbol_events:
             latest_prices[symbol] = float(frames[symbol].iloc[idx]["close"])
 
+        # --- 2) Intrabar stops and targets ---
+        for symbol, idx in symbol_events:
+            position = positions.get(symbol)
+            if position is None:
+                continue
+            bar = frames[symbol].iloc[idx]
+            open_price, high, low = float(bar["open"]), float(bar["high"]), float(bar["low"])
+            reference = None
+            reason = ""
+            if low <= position["stop"]:
+                reference, reason = stop_fill_reference(1, open_price, position["stop"], "stop"), "STOP"
+            elif high >= position["target"]:
+                reference, reason = stop_fill_reference(1, open_price, position["target"], "target"), "TARGET"
+            if reference is None:
+                continue
+            exit_fill = model.fill(-1, reference, position["qty"], **_bar_context(bar))
+            cash += position["qty"] * exit_fill.price
+            trades.append(_trade_record(symbol=symbol, entry_time=position["entry_time"], exit_time=timestamp,
+                                        entry_fill=position["entry_fill"], exit_fill=exit_fill, qty=position["qty"],
+                                        hold_bars=idx - position["entry_index"], reason=reason))
+            positions.pop(symbol, None)
+            pending_sells.discard(symbol)
+
+        # --- 3) Decide on this bar's close (executed at the next open) ---
         signal_by_symbol = {
             symbol: signal_for_index(
                 frames[symbol],
@@ -413,71 +507,15 @@ def backtest_portfolio(
         }
         strength_by_symbol = relative_strength_snapshot(
             frames,
-            idx_by_symbol={symbol: idx for symbol, idx in symbol_events},
+            idx_by_symbol=idx_by_symbol,
             lookback_bars=relative_strength_lookback,
         )
+        for symbol in idx_by_symbol:
+            if signal_by_symbol[symbol] == Signal.SELL and symbol in positions:
+                pending_sells.add(symbol)
 
-        for symbol, idx in symbol_events:
-            position = positions.get(symbol)
-            if position is None:
-                continue
-            bar = frames[symbol].iloc[idx]
-            high = float(bar["high"])
-            low = float(bar["low"])
-            exit_price = None
-            reason = ""
-            if low <= position["stop"]:
-                exit_price, reason = position["stop"], "STOP"
-            elif high >= position["target"]:
-                exit_price, reason = position["target"], "TARGET"
-            if exit_price is None:
-                continue
-            proceeds = position["qty"] * exit_price * (1 - cost_per_side)
-            pnl = proceeds - (position["qty"] * position["entry_price"])
-            cash += proceeds
-            trades.append(
-                {
-                    "symbol": symbol,
-                    "entry_time": position["entry_time"],
-                    "exit_time": timestamp,
-                    "entry": position["entry_price"],
-                    "exit": exit_price,
-                    "qty": position["qty"],
-                    "pnl": pnl,
-                    "pnl_pct": (exit_price / position["entry_price"]) - 1,
-                    "hold_bars": idx - position["entry_index"],
-                    "reason": reason,
-                }
-            )
-            positions.pop(symbol, None)
-
-        for symbol, idx in symbol_events:
-            bar = frames[symbol].iloc[idx]
-            signal = signal_by_symbol[symbol]
-            price = float(bar["close"])
-
-            if signal == Signal.SELL and symbol in positions:
-                position = positions.pop(symbol)
-                exit_price = price * (1 - cost_per_side)
-                cash += position["qty"] * exit_price
-                trades.append(
-                    {
-                        "symbol": symbol,
-                        "entry_time": position["entry_time"],
-                        "exit_time": timestamp,
-                        "entry": position["entry_price"],
-                        "exit": exit_price,
-                        "qty": position["qty"],
-                        "pnl": position["qty"] * (exit_price - position["entry_price"]),
-                        "pnl_pct": (exit_price / position["entry_price"]) - 1,
-                        "hold_bars": idx - position["entry_index"],
-                        "reason": "SIGNAL",
-                    }
-                )
-                continue
-
-        buy_candidates: list[tuple[float, str, int]] = []
-        for symbol, idx in symbol_events:
+        buy_candidates: list[tuple[float, str]] = []
+        for symbol in idx_by_symbol:
             if signal_by_symbol[symbol] != Signal.BUY or symbol in positions:
                 continue
             strength_snapshot = strength_by_symbol.get(symbol)
@@ -488,36 +526,9 @@ def backtest_portfolio(
             ):
                 continue
             score = strength_snapshot.score if strength_snapshot is not None else 0.0
-            buy_candidates.append((score, symbol, idx))
-
+            buy_candidates.append((score, symbol))
         buy_candidates.sort(key=lambda item: (-item[0], item[1]))
-
-        for _, symbol, idx in buy_candidates:
-            if symbol in positions or len(positions) >= max_open_positions:
-                continue
-            bar = frames[symbol].iloc[idx]
-            price = float(bar["close"])
-            equity = portfolio_equity()
-            gross_exposure = portfolio_gross_exposure()
-            available_notional = max((equity * max_gross_exposure_pct) - gross_exposure, 0.0)
-            desired_notional = min(
-                equity * target_position_pct,
-                available_notional,
-                cash,
-            )
-            entry_price = price * (1 + cost_per_side)
-            qty = int(desired_notional // entry_price)
-            if qty <= 0:
-                continue
-            cash -= qty * entry_price
-            positions[symbol] = {
-                "qty": qty,
-                "entry_price": entry_price,
-                "stop": round(entry_price * (1 - stop_loss_pct), 2),
-                "target": round(entry_price * (1 + take_profit_pct), 2),
-                "entry_time": timestamp,
-                "entry_index": idx,
-            }
+        pending_buys = [symbol for _, symbol in buy_candidates]
 
         equity = portfolio_equity()
         gross_exposure = portfolio_gross_exposure()
@@ -528,43 +539,23 @@ def backtest_portfolio(
     for symbol, position in list(positions.items()):
         frame = frames[symbol]
         final_bar = frame.iloc[-1]
-        final_time = final_bar["timestamp"]
-        final_price = float(final_bar["close"]) * (1 - cost_per_side)
-        cash += position["qty"] * final_price
-        trades.append(
-            {
-                "symbol": symbol,
-                "entry_time": position["entry_time"],
-                "exit_time": final_time,
-                "entry": position["entry_price"],
-                "exit": final_price,
-                "qty": position["qty"],
-                "pnl": position["qty"] * (final_price - position["entry_price"]),
-                "pnl_pct": (final_price / position["entry_price"]) - 1,
-                "hold_bars": max(len(frame) - 1 - position["entry_index"], 0),
-                "reason": "END",
-            }
-        )
+        exit_fill = model.fill(-1, float(final_bar["close"]), position["qty"], **_bar_context(final_bar))
+        cash += position["qty"] * exit_fill.price
+        trades.append(_trade_record(symbol=symbol, entry_time=position["entry_time"], exit_time=final_bar["timestamp"],
+                                    entry_fill=position["entry_fill"], exit_fill=exit_fill, qty=position["qty"],
+                                    hold_bars=max(len(frame) - 1 - position["entry_index"], 0), reason="END"))
 
     if equity_curve:
         equity_curve[-1] = cash
 
     buy_and_hold_return = float(
-        np.mean(
-            [
-                frame["close"].iloc[-1] / frame["close"].iloc[0] - 1
-                for frame in frames.values()
-                if len(frame) > 1
-            ]
-        )
+        np.mean([frame["close"].iloc[-1] / frame["close"].iloc[0] - 1 for frame in frames.values() if len(frame) > 1])
     )
-    trades_df = pd.DataFrame(trades)
-    equity_series = pd.Series(equity_curve, index=equity_index)
     exposure_pct = float(np.mean(exposure_samples)) if exposure_samples else 0.0
 
     return _result_from_components(
-        equity=equity_series,
-        trades_df=trades_df,
+        equity=pd.Series(equity_curve, index=equity_index),
+        trades_df=pd.DataFrame(trades),
         starting_cash=starting_cash,
         buy_and_hold_return=buy_and_hold_return,
         exposure_pct=exposure_pct,
