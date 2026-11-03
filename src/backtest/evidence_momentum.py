@@ -29,6 +29,23 @@ from typing import Iterable
 
 import numpy as np
 import pandas as pd
+
+from src.backtest.execution_model import (
+    ExecutionModel,
+    decision_view,
+    require_columns,
+    sigma_proxy,
+    stop_fill_reference,
+)
+
+DECISION_COLUMNS = (
+    "score",
+    "atr",
+    "long_entry_setup",
+    "long_exit_signal",
+    "short_entry_setup",
+    "short_exit_signal",
+)
 from loguru import logger
 
 
@@ -334,7 +351,12 @@ def backtest_evidence_momentum_portfolio(
     commission_bps: float = 1.0,
     slippage_bps: float = 2.0,
     bars_per_year_value: float = 252.0 * 6.5,
+    execution: ExecutionModel | None = None,
 ) -> BacktestResult:
+    """Portfolio backtest. Every decision (exit signal, ranking, entry
+    setup, ATR for stops) is read from the previous bar's close through the
+    ``prev_*`` columns and filled at the current bar's open; stops and
+    targets fire inside the bar with gap handling."""
     frames: dict[str, pd.DataFrame] = {}
     events: list[tuple[pd.Timestamp, str, int]] = []
     latest_prices: dict[str, float] = {}
@@ -350,6 +372,8 @@ def backtest_evidence_momentum_portfolio(
         ).reset_index(drop=False)
         if "timestamp" not in frame.columns:
             frame = frame.rename(columns={frame.columns[0]: "timestamp"})
+        require_columns(frame, ["open", "high", "low", "close"])
+        frame = decision_view(frame, DECISION_COLUMNS)
         frames[symbol] = frame
         latest_prices[symbol] = float(frame["close"].iloc[0])
         events.extend((frame.iloc[idx]["timestamp"], symbol, idx) for idx in range(1, len(frame)))
@@ -365,7 +389,19 @@ def backtest_evidence_momentum_portfolio(
             circuit_breaker_triggered=False,
         )
 
-    cost_per_side = (commission_bps + slippage_bps) / 10_000.0
+    model = execution or ExecutionModel.from_legacy(commission_bps, slippage_bps)
+    est_cost = (commission_bps + slippage_bps) / 10_000.0
+
+    def bar_context(row: pd.Series, reference: float) -> dict:
+        volume = row.get("volume")
+        atr_value = row.get("atr")
+        return {
+            "high": float(row["high"]),
+            "low": float(row["low"]),
+            "bar_volume": float(volume) if volume is not None and pd.notna(volume) else None,
+            "sigma_bar": sigma_proxy(float(atr_value) if atr_value is not None and pd.notna(atr_value) else None, reference),
+        }
+
     rebalance_interval_bars = sessions_to_bars(
         config.rebalance_interval_sessions,
         timeframe_minutes,
@@ -400,7 +436,7 @@ def backtest_evidence_momentum_portfolio(
     for timestamp in sorted(event_groups):
         symbol_events = event_groups[timestamp]
         for symbol, idx in symbol_events:
-            latest_prices[symbol] = float(frames[symbol].iloc[idx]["close"])
+            latest_prices[symbol] = float(frames[symbol].iloc[idx]["open"])
 
         equity_before_entries = portfolio_equity()
         peak_equity = max(peak_equity, equity_before_entries)
@@ -414,9 +450,9 @@ def backtest_evidence_momentum_portfolio(
                 continue
 
             row = frames[symbol].iloc[idx]
+            open_price = float(row["open"])
             high = float(row["high"])
             low = float(row["low"])
-            close = float(row["close"])
             position.holding_bars += 1
             position.highest_high = max(position.highest_high, high)
             position.lowest_low = min(position.lowest_low, low)
@@ -425,32 +461,26 @@ def backtest_evidence_momentum_portfolio(
             reported_exit_price = None
             reason = ""
 
+            # A signal exit decided on the previous close executes at this open,
+            # before anything inside the bar can happen.
             if position.side == 1:
-                if low <= position.stop_price:
-                    exit_trigger = position.stop_price
-                    reported_exit_price = position.stop_price
+                if bool(row["prev_long_exit_signal"]):
+                    exit_trigger, reason = open_price, "SIGNAL"
+                elif low <= position.stop_price:
+                    exit_trigger = stop_fill_reference(1, open_price, position.stop_price, "stop")
                     reason = "STOP"
                 elif high >= position.target_price:
-                    exit_trigger = position.target_price
-                    reported_exit_price = position.target_price
+                    exit_trigger = stop_fill_reference(1, open_price, position.target_price, "target")
                     reason = "TARGET"
-                elif bool(row["long_exit_signal"]):
-                    exit_trigger = close
-                    reported_exit_price = close * (1 - cost_per_side)
-                    reason = "SIGNAL"
             else:
-                if high >= position.stop_price:
-                    exit_trigger = position.stop_price
-                    reported_exit_price = position.stop_price
+                if bool(row["prev_short_exit_signal"]):
+                    exit_trigger, reason = open_price, "SIGNAL"
+                elif high >= position.stop_price:
+                    exit_trigger = stop_fill_reference(-1, open_price, position.stop_price, "stop")
                     reason = "STOP"
                 elif low <= position.target_price:
-                    exit_trigger = position.target_price
-                    reported_exit_price = position.target_price
+                    exit_trigger = stop_fill_reference(-1, open_price, position.target_price, "target")
                     reason = "TARGET"
-                elif bool(row["short_exit_signal"]):
-                    exit_trigger = close
-                    reported_exit_price = close * (1 + cost_per_side)
-                    reason = "SIGNAL"
 
             if exit_trigger is None:
                 current_atr = float(row["atr"])
@@ -469,17 +499,19 @@ def backtest_evidence_momentum_portfolio(
                         position.target_price = min(position.target_price, target_price)
                 continue
 
+            exit_fill = model.fill(-position.side, exit_trigger, position.qty, **bar_context(row, exit_trigger))
+            reported_exit_price = exit_fill.price
             if position.side == 1:
-                proceeds = position.qty * exit_trigger * (1 - cost_per_side)
+                proceeds = position.qty * exit_fill.price
                 pnl = proceeds - (position.qty * position.entry_price)
                 cash += proceeds
-                pnl_pct = (exit_trigger / position.entry_price) - 1.0
+                pnl_pct = (exit_fill.price / position.entry_price) - 1.0
                 side_label = "LONG"
             else:
-                cover_cost = position.qty * exit_trigger * (1 + cost_per_side)
+                cover_cost = position.qty * exit_fill.price
                 pnl = (position.qty * position.entry_price) - cover_cost
                 cash -= cover_cost
-                pnl_pct = (position.entry_price - (exit_trigger * (1 + cost_per_side))) / position.entry_price
+                pnl_pct = (position.entry_price - exit_fill.price) / position.entry_price
                 side_label = "SHORT"
             trades.append(
                 {
@@ -504,13 +536,13 @@ def backtest_evidence_momentum_portfolio(
             short_rankings: list[tuple[float, str, int]] = []
             for symbol, idx in symbol_events:
                 row = frames[symbol].iloc[idx]
-                score = row.get("score")
-                atr = row.get("atr")
+                score = row.get("prev_score")
+                atr = row.get("prev_atr")
                 if pd.isna(score) or pd.isna(atr):
                     continue
-                if bool(row["long_entry_setup"]):
+                if bool(row["prev_long_entry_setup"]):
                     long_rankings.append((float(score), symbol, idx))
-                if config.allow_short and bool(row["short_entry_setup"]):
+                if config.allow_short and bool(row["prev_short_entry_setup"]):
                     short_rankings.append((float(score), symbol, idx))
 
             long_rankings.sort(key=lambda item: (-item[0], item[1]))
@@ -524,9 +556,9 @@ def backtest_evidence_momentum_portfolio(
                 if position is None:
                     continue
                 row = frames[symbol].iloc[idx]
-                close = float(row["close"])
+                open_price = float(row["open"])
                 if position.side == 1 and symbol not in desired_longs:
-                    exit_price = close * (1 - cost_per_side)
+                    exit_price = model.fill(-1, open_price, position.qty, **bar_context(row, open_price)).price
                     cash += position.qty * exit_price
                     trades.append(
                         {
@@ -545,7 +577,7 @@ def backtest_evidence_momentum_portfolio(
                     )
                     positions.pop(symbol, None)
                 elif position.side == -1 and symbol not in desired_shorts:
-                    exit_price = close * (1 + cost_per_side)
+                    exit_price = model.fill(1, open_price, position.qty, **bar_context(row, open_price)).price
                     cash -= position.qty * exit_price
                     trades.append(
                         {
@@ -578,29 +610,30 @@ def backtest_evidence_momentum_portfolio(
                     if symbol in positions or len(positions) >= config.max_open_positions:
                         continue
                     row = frames[symbol].iloc[idx]
-                    close = float(row["close"])
+                    open_price = float(row["open"])
                     high = float(row["high"])
                     low = float(row["low"])
-                    atr = float(row["atr"])
-                    if not np.isfinite(atr) or atr <= 0 or close <= 0:
+                    atr = float(row["prev_atr"])
+                    if not np.isfinite(atr) or atr <= 0 or open_price <= 0:
                         continue
 
                     equity = portfolio_equity()
                     current_gross_exposure = gross_exposure()
                     available_notional = max((equity * config.max_gross_exposure_pct) - current_gross_exposure, 0.0)
-                    entry_price = close * (1 + cost_per_side) if side == 1 else close * (1 - cost_per_side)
+                    est_price = open_price * (1 + est_cost) if side == 1 else open_price * (1 - est_cost)
                     risk_budget = equity * config.risk_per_trade_pct
-                    per_share_risk = (config.atr_stop_mult * atr) + (entry_price * (2 * cost_per_side))
+                    per_share_risk = (config.atr_stop_mult * atr) + (est_price * (2 * est_cost))
                     qty_by_risk = floor(risk_budget / per_share_risk) if per_share_risk > 0 else 0
-                    qty_by_position_cap = floor((equity * config.max_position_pct) / entry_price)
+                    qty_by_position_cap = floor((equity * config.max_position_pct) / est_price)
                     qty_by_available = (
-                        floor(min(cash, available_notional) / entry_price)
+                        floor(min(cash, available_notional) / est_price)
                         if side == 1
-                        else floor(available_notional / max(close, 1e-9))
+                        else floor(available_notional / max(open_price, 1e-9))
                     )
                     qty = max(min(qty_by_risk, qty_by_position_cap, qty_by_available), 0)
                     if qty <= 0:
                         continue
+                    entry_price = model.fill(side, open_price, qty, **bar_context(row, open_price)).price
 
                     if side == 1:
                         cash -= qty * entry_price
@@ -625,6 +658,8 @@ def backtest_evidence_momentum_portfolio(
                         lowest_low=low,
                     )
 
+        for symbol, idx in symbol_events:
+            latest_prices[symbol] = float(frames[symbol].iloc[idx]["close"])
         equity = portfolio_equity()
         equity_curve.append(equity)
         equity_index.append(timestamp)
@@ -635,14 +670,13 @@ def backtest_evidence_momentum_portfolio(
         final_bar = frame.iloc[-1]
         final_time = final_bar["timestamp"]
         final_close = float(final_bar["close"])
+        exit_price = model.fill(-position.side, final_close, position.qty, **bar_context(final_bar, final_close)).price
         if position.side == 1:
-            exit_price = final_close * (1 - cost_per_side)
             pnl = (position.qty * exit_price) - (position.qty * position.entry_price)
             cash += position.qty * exit_price
             pnl_pct = (exit_price / position.entry_price) - 1.0
             side_label = "LONG"
         else:
-            exit_price = final_close * (1 + cost_per_side)
             pnl = (position.qty * position.entry_price) - (position.qty * exit_price)
             cash -= position.qty * exit_price
             pnl_pct = (position.entry_price - exit_price) / position.entry_price
