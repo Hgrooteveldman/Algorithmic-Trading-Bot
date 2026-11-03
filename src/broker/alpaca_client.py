@@ -32,7 +32,11 @@ from alpaca.trading.requests import (
     TakeProfitRequest,
 )
 
+import uuid
+
 from config.settings import settings
+from src.broker.models import OrderAck, Quote, validate_bars
+from src.broker.retry import with_retry
 from src.market.session import attach_market_timezone
 
 
@@ -44,6 +48,22 @@ def _to_alpaca_timeframe(minutes: int) -> TimeFrame:
     if minutes >= 1440 and minutes % 1440 == 0:
         return TimeFrame(amount=minutes // 1440, unit=TimeFrameUnit.Day)
     return TimeFrame(amount=minutes, unit=TimeFrameUnit.Minute)
+
+
+def _client_order_id(symbol: str) -> str:
+    """Unique, traceable id so a submission lost to a timeout can be looked
+    up instead of resubmitted (submits are never retried automatically)."""
+    return f"algobot-{symbol.lower()}-{uuid.uuid4().hex[:16]}"
+
+
+def _acknowledge(order):
+    """Validate the broker's response; keep returning the SDK object so
+    existing callers (``order.id``) are unchanged."""
+    try:
+        OrderAck.model_validate(order)
+    except Exception as exc:
+        logger.bind(event="unexpected_order_ack").error(f"Order acknowledgement failed validation: {exc}")
+    return order
 
 
 class AlpacaClient:
@@ -66,6 +86,7 @@ class AlpacaClient:
         logger.info(f"AlpacaClient initialised in {mode} mode")
 
     # ----- Account ---------------------------------------------------
+    @with_retry()
     def get_account(self):
         return self.trading.get_account()
 
@@ -82,9 +103,11 @@ class AlpacaClient:
             logger.warning(f"Clock check failed: {e}; assuming closed.")
             return False
 
+    @with_retry()
     def get_clock(self):
         return self.trading.get_clock()
 
+    @with_retry()
     def get_closed_orders(self, after: datetime, limit: int = 200):
         request = GetOrdersRequest(
             status=QueryOrderStatus.CLOSED,
@@ -103,6 +126,7 @@ class AlpacaClient:
         return days[0]
 
     # ----- Positions -------------------------------------------------
+    @with_retry()
     def get_positions(self) -> List:
         return self.trading.get_all_positions()
 
@@ -130,7 +154,7 @@ class AlpacaClient:
             end=end,
         )
         try:
-            bars = self.data.get_stock_bars(req).df
+            bars = with_retry()(self.data.get_stock_bars)(req).df
         except Exception as e:
             logger.exception(f"Bar fetch failed for {symbol}: {e}")
             return pd.DataFrame()
@@ -138,7 +162,7 @@ class AlpacaClient:
             return pd.DataFrame()
         if isinstance(bars.index, pd.MultiIndex):
             bars = bars.xs(symbol, level=0)
-        return bars
+        return validate_bars(bars, symbol)
 
     def get_latest_price(self, symbol: str) -> Optional[float]:
         """Mid price from the latest quote, or None if unavailable."""
@@ -154,20 +178,14 @@ class AlpacaClient:
             return None
 
     def get_latest_quote(self, symbol: str) -> Optional[dict]:
-        """Return the latest quote in a simple, test-friendly shape."""
+        """Latest quote, validated (no crossed or empty quotes), as
+        ``{"bid", "ask", "mid"}``. None if unavailable or invalid."""
         try:
             req = StockLatestQuoteRequest(symbol_or_symbols=symbol)
-            quote = self.data.get_stock_latest_quote(req)[symbol]
-            bid = float(quote.bid_price or 0)
-            ask = float(quote.ask_price or 0)
-            mid = (ask + bid) / 2 if ask > 0 and bid > 0 else (ask or bid or 0.0)
-            return {
-                "bid": bid,
-                "ask": ask,
-                "mid": mid,
-            }
+            raw = with_retry()(self.data.get_stock_latest_quote)(req)[symbol]
+            return Quote.from_alpaca(symbol, raw).as_dict()
         except Exception as e:
-            logger.warning(f"Quote fetch failed for {symbol}: {e}")
+            logger.warning(f"Quote fetch/validation failed for {symbol}: {e}")
             return None
 
     # ----- Orders ----------------------------------------------------
@@ -199,8 +217,9 @@ class AlpacaClient:
             order_class=OrderClass.BRACKET,
             stop_loss=stop_loss,
             take_profit=TakeProfitRequest(limit_price=take_profit_price),
+            client_order_id=_client_order_id(symbol),
         )
-        return self.trading.submit_order(order)
+        return _acknowledge(self.trading.submit_order(order))
 
     def submit_entry_order(
         self,
@@ -227,8 +246,9 @@ class AlpacaClient:
             side=side,
             time_in_force=TimeInForce.DAY,
             extended_hours=settings.allow_extended_hours,
+            client_order_id=_client_order_id(symbol),
         )
-        return self.trading.submit_order(order)
+        return _acknowledge(self.trading.submit_order(order))
 
     def close_position(self, symbol: str):
         return self.trading.close_position(symbol)

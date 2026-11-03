@@ -17,6 +17,7 @@ from loguru import logger
 
 from config.settings import settings
 from src.broker.alpaca_client import AlpacaClient
+from src.data.bar_stream import BarStream
 from src.data.market_data import close_returns_for_correlation, get_recent_bars
 from src.execution.order_executor import OrderExecutor
 from src.execution.trade_reconciliation import (
@@ -151,6 +152,15 @@ def main() -> None:
     flattened_session_date = runtime_state.flattened_session_date
     last_bar_timestamps = dict(runtime_state.last_bar_timestamps)
     configured_symbols = list(dict.fromkeys(settings.symbols))
+
+    # Wake on new bars when the stream is up; otherwise this is a plain sleep.
+    bar_stream = BarStream(configured_symbols).start() if settings.use_websocket_market_data else None
+
+    def wait_for_next_cycle(seconds: float) -> None:
+        if bar_stream is not None:
+            bar_stream.wait_for_bar(seconds)
+        else:
+            time.sleep(seconds)
 
     while True:
         try:
@@ -503,10 +513,12 @@ def main() -> None:
                 last_bar_timestamps=last_bar_timestamps,
             )
 
-            time.sleep(settings.poll_interval_seconds)
+            wait_for_next_cycle(settings.poll_interval_seconds)
 
         except KeyboardInterrupt:
             logger.info("Manual interrupt. Shutting down.")
+            if bar_stream is not None:
+                bar_stream.stop()
             break
         except Exception as e:
             logger.exception(f"Unhandled error in main loop: {e}")

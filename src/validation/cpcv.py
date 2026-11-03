@@ -123,7 +123,7 @@ class CPCVResult:
             "oos_sharpe_p10": float(np.percentile(annual, 10)) if len(annual) else float("nan"),
             "oos_sharpe_min": float(np.min(annual)) if len(annual) else float("nan"),
             "share_paths_positive": float(np.mean(annual > 0)) if len(annual) else float("nan"),
-            "most_selected": max(self.selection_counts, key=self.selection_counts.get) if self.selection_counts else None,
+            "most_selected": max(self.selection_counts, key=lambda name: self.selection_counts[name]) if self.selection_counts else None,
         }
 
 
